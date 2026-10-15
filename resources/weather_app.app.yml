@@ -1,0 +1,12 @@
+# Databricks App resource for the Flask weather + watchlist app.
+# Source code (app.py, app.yaml, lakebase.py, etc.) lives in the project root.
+#
+# Deploy: databricks bundle deploy -t dev
+# The app name is namespaced per developer to avoid workspace collisions.
+
+resources:
+  apps:
+    weather_app:
+      name: weather-app-${workspace.current_user.domain_friendly_name}
+      description: "Flask app with Lakebase Postgres — weather alerts/forecasts (NWS API) and stock watchlist (Massive API)"
+      source_code_path: ..

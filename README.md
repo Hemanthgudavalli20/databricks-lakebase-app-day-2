@@ -8,7 +8,7 @@ A minimal Databricks App that:
 
 ## Files
 
-- `app.py` - Flask app: `/healthz`, `/records` (GET), `/sync` (POST), `/watchlist` (GET/POST/DELETE), `/news/sync` (POST)
+- `app.py` - Flask app: `/healthz`, `/records` (GET), `/sync` (POST), `/watchlist` (GET/POST/DELETE), `/news/sync` (POST), `/search` (POST)
 - `lakebase.py` - Lakebase connection helper (single `LAKEBASE_URL`, psycopg2 + SQLAlchemy)
 - `massive_client.py` - Massive API client: pagination generator for large datasets, `get_latest_price`, `get_news`
 - `setup_secrets.py` - One-time script to create the secret scopes and store the Massive API key + Lakebase URL

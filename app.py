@@ -19,6 +19,10 @@ from flask import Flask, jsonify, render_template, request
 
 import lakebase
 from massive_client import MassiveClient
+from weather_client import WeatherClient
+
+# Lazy-load the embedding model on first search request
+_embedding_model = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("massive-app")
@@ -29,6 +33,8 @@ _w = WorkspaceClient()
 TABLE_NAME = os.environ.get("MASSIVE_TABLE_NAME", "massive_records")
 WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
 NEWS_TABLE_NAME = os.environ.get("NEWS_TABLE_NAME", "ticker_news_documents")
+LOCATIONLIST_TABLE_NAME = os.environ.get("LOCATIONLIST_TABLE_NAME", "locationlist")
+WEATHER_DOCUMENTS_TABLE_NAME = os.environ.get("WEATHER_DOCUMENTS_TABLE_NAME", "weather_documents")
 
 # Tickers to fetch news for by default (comma-separated), e.g. "AAPL,MSFT,GOOGL"
 DEFAULT_NEWS_TICKERS = [
@@ -68,6 +74,50 @@ def ensure_watchlist_table():
             PRIMARY KEY (symbol, email)
         )
         """
+    )
+
+
+def ensure_locationlist_table():
+    """Create the locationlist table in Lakebase if it doesn't exist yet."""
+    lakebase.run_write(
+        f"""
+        CREATE TABLE IF NOT EXISTS {LOCATIONLIST_TABLE_NAME} (
+            latitude DOUBLE PRECISION NOT NULL,
+            longitude DOUBLE PRECISION NOT NULL,
+            city TEXT,
+            state TEXT,
+            email TEXT NOT NULL,
+            searched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (latitude, longitude, email)
+        )
+        """
+    )
+
+
+def ensure_weather_documents_table():
+    """Create the weather_documents table in Lakebase if it doesn't exist yet."""
+    lakebase.run_write(
+        f"""
+        CREATE TABLE IF NOT EXISTS {WEATHER_DOCUMENTS_TABLE_NAME} (
+            id TEXT PRIMARY KEY,
+            location TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            headline TEXT,
+            narrative_text TEXT,
+            issued_at TIMESTAMPTZ,
+            effective_at TIMESTAMPTZ,
+            payload JSONB NOT NULL,
+            synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    lakebase.run_write(
+        f"CREATE INDEX IF NOT EXISTS idx_{WEATHER_DOCUMENTS_TABLE_NAME}_location "
+        f"ON {WEATHER_DOCUMENTS_TABLE_NAME} (location)"
+    )
+    lakebase.run_write(
+        f"CREATE INDEX IF NOT EXISTS idx_{WEATHER_DOCUMENTS_TABLE_NAME}_source_type "
+        f"ON {WEATHER_DOCUMENTS_TABLE_NAME} (source_type)"
     )
 
 
@@ -284,6 +334,210 @@ def delete_from_watchlist(symbol: str):
         return jsonify({"error": f"{symbol} is not on your watchlist"}), 404
 
     return jsonify({"symbol": symbol, "email": email, "deleted": True})
+
+
+@app.route("/locationlist", methods=["GET"])
+def get_locationlist():
+    """Return the current user's searched locations, with search timestamps."""
+    ensure_locationlist_table()
+    email = _current_user_email()
+    rows = lakebase.run_query(
+        f"SELECT latitude, longitude, city, state, email, searched_at FROM {LOCATIONLIST_TABLE_NAME} "
+        f"WHERE email = %s ORDER BY searched_at DESC",
+        (email,),
+    )
+    return jsonify(rows)
+
+
+@app.route("/locationlist", methods=["POST"])
+def add_to_locationlist():
+    """
+    Accept a latitude/longitude pair submitted by the user (for lookup via
+    api.weather.gov / weather_client.py), then add/update that location on
+    the locationlist in Lakebase with the searcher's email and timestamp.
+    """
+    ensure_locationlist_table()
+
+    if request.is_json:
+        latitude = request.json.get("latitude")
+        longitude = request.json.get("longitude")
+    else:
+        latitude = request.form.get("latitude")
+        longitude = request.form.get("longitude")
+
+    try:
+        latitude = float(latitude)
+        longitude = float(longitude)
+    except (TypeError, ValueError):
+        return jsonify({"error": "latitude and longitude must be valid numbers"}), 400
+
+    if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
+        return jsonify({"error": "latitude must be in [-90, 90], longitude in [-180, 180]"}), 400
+
+    # Resolve city/state from the NWS /points endpoint (same call used by
+    # weather_client.py for forecast lookups). If the API is unavailable or
+    # returns no relativeLocation, we still store the coordinates with null
+    # city/state so the user's search is never lost.
+    city = None
+    state = None
+    try:
+        wc = WeatherClient()
+        loc = wc.get_location_name(latitude, longitude)
+        city = loc.get("city")
+        state = loc.get("state")
+    except Exception as exc:
+        logger.warning("Could not resolve city/state for (%s, %s): %s", latitude, longitude, exc)
+
+    email = _current_user_email()
+
+    lakebase.run_write(
+        f"""
+        INSERT INTO {LOCATIONLIST_TABLE_NAME} (latitude, longitude, city, state, email, searched_at)
+        VALUES (%s, %s, %s, %s, %s, now())
+        ON CONFLICT (latitude, longitude, email) DO UPDATE
+            SET city = EXCLUDED.city,
+                state = EXCLUDED.state,
+                searched_at = EXCLUDED.searched_at
+        """,
+        (latitude, longitude, city, state, email),
+    )
+
+    # Fetch alerts + forecast for this location and upsert into weather_documents
+    weather_doc_count = _upsert_weather_documents(latitude, longitude, city, state)
+    logger.info("Upserted %d weather documents for (%s, %s)", weather_doc_count, latitude, longitude)
+
+    return jsonify({"latitude": latitude, "longitude": longitude, "city": city, "state": state, "email": email, "weather_documents": weather_doc_count})
+
+
+@app.route("/locationlist", methods=["DELETE"])
+def delete_from_locationlist():
+    """Remove a single location from the current user's locationlist."""
+    ensure_locationlist_table()
+
+    try:
+        latitude = float(request.args.get("latitude"))
+        longitude = float(request.args.get("longitude"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "latitude and longitude query params are required"}), 400
+
+    email = _current_user_email()
+    deleted = lakebase.run_write(
+        f"DELETE FROM {LOCATIONLIST_TABLE_NAME} WHERE latitude = %s AND longitude = %s AND email = %s",
+        (latitude, longitude, email),
+    )
+
+    if not deleted:
+        return jsonify({"error": f"Location ({latitude}, {longitude}) is not on your locationlist"}), 404
+
+    return jsonify({"latitude": latitude, "longitude": longitude, "email": email, "deleted": True})
+
+
+def _upsert_weather_documents(latitude: float, longitude: float, city: str | None, state: str | None) -> int:
+    """
+    Fetch active alerts and the forecast for a location from the NWS API,
+    normalize them into a common schema, and upsert into the
+    weather_documents table in Lakebase.
+
+    Returns the number of documents upserted.
+    """
+    import hashlib
+    import json as _json
+
+    ensure_weather_documents_table()
+    location_str = f"{city}, {state}" if city and state else f"{latitude},{longitude}"
+    wc = WeatherClient()
+
+    docs: list[dict] = []
+
+    # --- Alerts ---
+    try:
+        alerts = wc.get_active_alerts(latitude, longitude)
+    except Exception as exc:
+        logger.warning("Could not fetch alerts for (%s, %s): %s", latitude, longitude, exc)
+        alerts = []
+
+    for alert in alerts:
+        props = alert.get("properties", {})
+        alert_id = alert.get("id") or props.get("id")
+        if not alert_id:
+            continue
+        description = props.get("description") or ""
+        instruction = props.get("instruction") or ""
+        narrative = (description + "\n\n" + instruction).strip() if instruction else description
+        docs.append({
+            "id": alert_id,
+            "location": location_str,
+            "source_type": "alert",
+            "headline": props.get("event"),
+            "narrative_text": narrative or None,
+            "issued_at": props.get("sent"),
+            "effective_at": props.get("effective"),
+            "payload": _json.dumps(alert),
+        })
+
+    # --- Forecast periods ---
+    try:
+        point_info = wc.get_point_info(latitude, longitude, include_forecast=True)
+        forecast = point_info.get("properties", {}).get("_forecast")
+    except Exception as exc:
+        logger.warning("Could not fetch forecast for (%s, %s): %s", latitude, longitude, exc)
+        forecast = None
+
+    if forecast:
+        generated_at = forecast.get("properties", {}).get("generatedAt")
+        for period in forecast.get("properties", {}).get("periods", []):
+            start_time = period.get("startTime")
+            if not start_time:
+                continue
+            raw = f"{latitude},{longitude}_{start_time}"
+            doc_id = "fc_" + hashlib.md5(raw.encode()).hexdigest()
+            docs.append({
+                "id": doc_id,
+                "location": location_str,
+                "source_type": "forecast",
+                "headline": period.get("name"),
+                "narrative_text": period.get("detailedForecast"),
+                "issued_at": generated_at,
+                "effective_at": start_time,
+                "payload": _json.dumps(period),
+            })
+
+    # --- Upsert ---
+    count = 0
+    if docs:
+        with lakebase.get_connection() as conn:
+            with conn.cursor() as cur:
+                for doc in docs:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {WEATHER_DOCUMENTS_TABLE_NAME} (
+                            id, location, source_type, headline, narrative_text,
+                            issued_at, effective_at, payload, synced_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
+                        ON CONFLICT (id) DO UPDATE
+                            SET headline = EXCLUDED.headline,
+                                narrative_text = EXCLUDED.narrative_text,
+                                issued_at = EXCLUDED.issued_at,
+                                effective_at = EXCLUDED.effective_at,
+                                payload = EXCLUDED.payload,
+                                synced_at = EXCLUDED.synced_at
+                        """,
+                        (
+                            doc["id"],
+                            doc["location"],
+                            doc["source_type"],
+                            doc["headline"],
+                            doc["narrative_text"],
+                            doc["issued_at"],
+                            doc["effective_at"],
+                            doc["payload"],
+                        ),
+                    )
+                    count += 1
+            conn.commit()
+
+    return count
 
 
 def _extract_latest_price(data: dict) -> float | None:

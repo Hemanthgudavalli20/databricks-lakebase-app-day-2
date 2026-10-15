@@ -150,13 +150,27 @@ print(f"  Using raw credentials from secret (no OAuth)")
 
 # COMMAND ----------
 
-# DBTITLE 1,Test Psycopg2 connection
+# DBTITLE 1,Test psycopg2 connection (weather-db)
 import psycopg2
+
+# The secret URL in cell 7 points to the old "new-database" project whose
+# branch is archived and endpoint disabled. Override the connection variables
+# to use the active "weather-db" project with short-lived OAuth credentials.
+db_host = "ep-shiny-rice-d8wqgz3x.database.us-east-2.cloud.databricks.com"
+db_port = 5432
+db_name = "databricks_postgres"
+
+from databricks.sdk import WorkspaceClient as _W
+_w = _W()
+_cred = _w.postgres.generate_database_credential(
+    endpoint="projects/weather-db/branches/production/endpoints/primary"
+)
+db_user = "hemanthbigdataengineer@gmail.com"
+db_password = _cred.token
 
 print(f"Testing connection to {db_host}:{db_port}/{db_name}")
 print(f"Using OAuth token authentication as user: {db_user}\n")
 
-# Test psycopg3 connection with OAuth token
 try:
     conn = psycopg2.connect(
         host=db_host,
@@ -165,7 +179,7 @@ try:
         user=db_user,
         password=db_password,
         sslmode='require',
-        connect_timeout=10
+        connect_timeout=15
     )
     cursor = conn.cursor()
     cursor.execute(f"SELECT COUNT(*) FROM {WATCHLIST_TABLE_NAME}")
@@ -181,7 +195,7 @@ try:
     
     cursor.close()
     conn.close()
-    print("\n✅ psycopg3 with OAuth authentication working correctly!")
+    print("\n✅ psycopg2 with OAuth authentication working correctly!")
 except Exception as e:
     import traceback
     print(f"❌ Connection failed: {e}")
@@ -222,23 +236,24 @@ except Exception as e:
 # COMMAND ----------
 
 # DBTITLE 1,Fetch news and sync using Lakebase SDK
-import base64 as _b64
+import hashlib
 import json as _json
 import time
-from datetime import datetime
 
 import psycopg2
 import requests
 
+NWS_BASE_URL = "https://api.weather.gov"
+_NWS_SESSION = requests.Session()
+_NWS_SESSION.headers.update({
+    "User-Agent": "databricks-lakebase-app/1.0 (contact@example.com)",
+    "Accept": "application/geo+json",
+})
 
-def get_massive_api_key() -> str:
-    secret = w.secrets.get_secret(scope=MASSIVE_SECRET_SCOPE, key=MASSIVE_SECRET_KEY)
-    return _b64.b64decode(secret.value).decode("utf-8")
 
-
-def get_watchlist_tickers() -> list[str]:
-    """Distinct, uppercased ticker symbols currently tracked across all users
-    in the watchlist table - these are the only tickers we fetch news for."""
+def get_watchlist_locations() -> list[dict]:
+    """Distinct locations currently tracked across all users in the
+    locationlist table — these are the coordinates we fetch weather for."""
     conn = psycopg2.connect(
         host=db_host,
         port=db_port,
@@ -249,99 +264,127 @@ def get_watchlist_tickers() -> list[str]:
     )
     try:
         cursor = conn.cursor()
-        cursor.execute(f"SELECT DISTINCT symbol FROM {WATCHLIST_TABLE_NAME} WHERE symbol IS NOT NULL")
-        symbols = cursor.fetchall()
-        return [row[0].strip().upper() for row in symbols if row[0]]
+        cursor.execute(f"""
+            SELECT DISTINCT latitude, longitude, city, state
+            FROM {WATCHLIST_TABLE_NAME}
+            WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+        """)
+        rows = cursor.fetchall()
+        return [
+            {"latitude": float(r[0]), "longitude": float(r[1]), "city": r[2], "state": r[3]}
+            for r in rows
+        ]
     finally:
         cursor.close()
         conn.close()
 
 
-def fetch_news_for_ticker(session: requests.Session, ticker: str, limit: int) -> list[dict]:
-    """Single GET /v2/reference/news call for one ticker (mirrors
-    MassiveClient.get_news in massive_client.py)."""
-    resp = session.get(
-        f"{MASSIVE_API_BASE_URL}/v2/reference/news",
-        params={"ticker": ticker, "limit": limit, "order": "desc", "sort": "published_utc"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json().get("results", [])
+def fetch_weather_for_location(lat: float, lon: float) -> list[dict]:
+    """Fetch active alerts and forecast for a location from the NWS API
+    (api.weather.gov) and normalize into the weather_documents schema."""
+    docs = []
 
+    # --- Alerts ---
+    try:
+        resp = _NWS_SESSION.get(
+            f"{NWS_BASE_URL}/alerts/active",
+            params={"point": f"{lat},{lon}"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        alerts = resp.json().get("features", [])
+    except Exception as exc:
+        print(f"    Could not fetch alerts: {exc}")
+        alerts = []
 
-def sync_news_to_lakebase(ticker: str, articles: list[dict]) -> int:
-    """Convert Massive API response and insert via Lakebase SDK executeLakebasePostgresSql tool.
-    Uses ON CONFLICT DO NOTHING for automatic deduplication."""
-    if not articles:
-        return 0
-    
-    rows = []
-    for article in articles:
-        sentiment = None
-        sentiment_reasoning = None
-        for insight in article.get("insights", []) or []:
-            if insight.get("ticker") == ticker:
-                sentiment = insight.get("sentiment")
-                sentiment_reasoning = insight.get("sentiment_reasoning")
-                break
-
-        publisher = article.get("publisher") or {}
-        rows.append({
-            "id": str(article.get("id")),
-            "ticker": ticker,
-            "title": article.get("title", ""),
-            "description": article.get("description"),
-            "author": article.get("author"),
-            "article_url": article.get("article_url"),
-            "publisher_name": publisher.get("name"),
-            "keywords": _json.dumps(article.get("keywords", [])),
-            "sentiment": sentiment,
-            "sentiment_reasoning": sentiment_reasoning,
-            "published_utc": article.get("published_utc"),
-            "payload": _json.dumps(article),
+    for alert in alerts:
+        props = alert.get("properties", {})
+        alert_id = alert.get("id") or props.get("id")
+        if not alert_id:
+            continue
+        description = props.get("description") or ""
+        instruction = props.get("instruction") or ""
+        narrative = (description + "\n\n" + instruction).strip() if instruction else description
+        docs.append({
+            "id": alert_id,
+            "source_type": "alert",
+            "headline": props.get("event"),
+            "narrative_text": narrative or None,
+            "issued_at": props.get("sent"),
+            "effective_at": props.get("effective"),
+            "payload": _json.dumps(alert),
         })
 
-    # We'll collect these rows and write them via the assistant's executeLakebasePostgresSql tool
-    # Store in a global so the next cell can access them
-    return rows
+    # --- Forecast ---
+    try:
+        point_resp = _NWS_SESSION.get(f"{NWS_BASE_URL}/points/{lat},{lon}", timeout=30)
+        point_resp.raise_for_status()
+        forecast_url = point_resp.json().get("properties", {}).get("forecast", "")
+
+        forecast = None
+        if forecast_url:
+            fc_resp = _NWS_SESSION.get(forecast_url, timeout=30)
+            fc_resp.raise_for_status()
+            forecast = fc_resp.json()
+    except Exception as exc:
+        print(f"    Could not fetch forecast: {exc}")
+        forecast = None
+
+    if forecast:
+        generated_at = forecast.get("properties", {}).get("generatedAt")
+        for period in forecast.get("properties", {}).get("periods", []):
+            start_time = period.get("startTime")
+            if not start_time:
+                continue
+            raw = f"{lat},{lon}_{start_time}"
+            doc_id = "fc_" + hashlib.md5(raw.encode()).hexdigest()
+            docs.append({
+                "id": doc_id,
+                "source_type": "forecast",
+                "headline": period.get("name"),
+                "narrative_text": period.get("detailedForecast"),
+                "issued_at": generated_at,
+                "effective_at": start_time,
+                "payload": _json.dumps(period),
+            })
+
+    return docs
 
 
-print("NOTE: Before running this cell, ensure you've run sql/01_setup_news_table.sql")
-print("      to create the ticker_news_documents table in your Lakebase database.\n")
+print("NOTE: Before running this cell, ensure you've run sql/05_setup_weather_documents.sql")
+print("      to create the weather_documents table in your Lakebase database.\n")
 
-tickers = get_watchlist_tickers()
-print(f"Found {len(tickers)} distinct watchlisted tickers: {tickers}")
+locations = get_watchlist_locations()
+print(f"Found {len(locations)} distinct watchlisted locations")
 
-# Enforce MAX_REQUESTS_PER_MINUTE by spacing calls evenly across a minute -
-# e.g. 5/min -> one request every 12s. Sleeping BEFORE each call after the
-# first keeps this correct even if a single request itself takes a while.
-_seconds_between_requests = 60.0 / MAX_REQUESTS_PER_MINUTE
+# NWS API is free and open — no rate limit, but be respectful with 1s between calls.
+_seconds_between_requests = 1.0
 
-_massive_session = requests.Session()
-_massive_session.headers.update(
-    {"Authorization": f"Bearer {get_massive_api_key()}", "Content-Type": "application/json"}
-)
-
-news_synced = 0
-all_news_rows = []  # Collect all rows to insert via Lakebase SDK
-for i, ticker in enumerate(tickers):
+all_news_rows = []  # Reused variable name for downstream cell compatibility
+for i, loc in enumerate(locations):
     if i > 0:
         time.sleep(_seconds_between_requests)
+
+    lat, lon = loc["latitude"], loc["longitude"]
+    city, state = loc["city"], loc["state"]
+    location_str = f"{city}, {state}" if city and state else f"{lat},{lon}"
+
     try:
-        articles = fetch_news_for_ticker(_massive_session, ticker, NEWS_FETCH_LIMIT)
-        batch_rows = sync_news_to_lakebase(ticker, articles)
-        if batch_rows:
-            all_news_rows.extend(batch_rows)
+        docs = fetch_weather_for_location(lat, lon)
+        for doc in docs:
+            doc["location"] = location_str
+        all_news_rows.extend(docs)
+        print(f"  ({location_str}) → {len(docs)} weather documents")
     except Exception as exc:
-        print(f"Skipping {ticker}: failed to fetch/sync news ({exc})")
+        print(f"  Skipping ({location_str}): {exc}")
         continue
 
-print(f"\nCollected {len(all_news_rows)} news articles to insert via Lakebase SDK.")
-print(f"Run the next cell to insert them using executeLakebasePostgresSql tool.")
+print(f"\nCollected {len(all_news_rows)} weather documents to insert.")
+print(f"Run the next cell to insert them into {NEWS_TABLE_NAME}.")
 
 # COMMAND ----------
 
-# DBTITLE 1,Insert collected news articles using psycopg2
+# DBTITLE 1,Insert weather documents using psycopg2
 import psycopg2
 
 # Build connection using psycopg2
@@ -357,41 +400,46 @@ conn = psycopg2.connect(
 try:
     cursor = conn.cursor()
     
-    # Prepare data tuples for batch insert
+    # Prepare data tuples for batch insert into weather_documents
     insert_data = [
         (
             row['id'],
-            row['ticker'],
-            row['title'],
-            row['description'],
-            row['author'],
-            row['article_url'],
-            row['publisher_name'],
-            row['keywords'],
-            row['sentiment'],
-            row['sentiment_reasoning'],
-            row['published_utc'],
+            row['location'],
+            row['source_type'],
+            row['headline'],
+            row['narrative_text'],
+            row['issued_at'],
+            row['effective_at'],
             row['payload']
         )
         for row in all_news_rows
     ]
     
-    # Batch insert with ON CONFLICT DO NOTHING for deduplication
-    insert_sql = f"""
-        INSERT INTO {NEWS_TABLE_NAME} (
-            id, ticker, title, description, author, article_url, publisher_name,
-            keywords, sentiment, sentiment_reasoning, published_utc, payload, synced_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-        ON CONFLICT (id) DO NOTHING
-    """
-    
-    # executemany in psycopg3 is much faster than individual INSERTs
-    cursor.executemany(insert_sql, insert_data)
-    
-    conn.commit()
-    inserted_count = cursor.rowcount
-    print(f"✅ Successfully inserted {inserted_count} new news articles")
-    print(f"   (Duplicates were skipped via ON CONFLICT DO NOTHING)")
+    if not insert_data:
+        print("No weather documents to insert (locationlist may be empty).")
+    else:
+        # Batch insert with ON CONFLICT DO UPDATE to refresh data on re-fetch
+        insert_sql = f"""
+            INSERT INTO {NEWS_TABLE_NAME} (
+                id, location, source_type, headline, narrative_text,
+                issued_at, effective_at, payload, synced_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (id) DO UPDATE
+                SET headline = EXCLUDED.headline,
+                    narrative_text = EXCLUDED.narrative_text,
+                    issued_at = EXCLUDED.issued_at,
+                    effective_at = EXCLUDED.effective_at,
+                    payload = EXCLUDED.payload,
+                    synced_at = EXCLUDED.synced_at
+        """
+        
+        # executemany is much faster than individual INSERTs
+        cursor.executemany(insert_sql, insert_data)
+        
+        conn.commit()
+        inserted_count = cursor.rowcount
+        print(f"✅ Successfully upserted {len(insert_data)} weather documents into {NEWS_TABLE_NAME}")
+        print(f"   (Existing documents were updated via ON CONFLICT DO UPDATE)")
     
 finally:
     cursor.close()
@@ -409,10 +457,11 @@ print(f"\nReady to compute embeddings! Run the cells below to continue.")
 
 # COMMAND ----------
 
+# DBTITLE 1,Load weather documents from Lakebase
 import pandas as pd
 import psycopg2
 
-# Load news documents using psycopg2
+# Load weather documents using psycopg2
 conn = psycopg2.connect(
     host=db_host,
     port=db_port,
@@ -423,24 +472,27 @@ conn = psycopg2.connect(
 )
 
 try:
-    # Query with embedding_text computed
+    # Query with embedding_text computed from headline + narrative_text
     query = f"""
         SELECT 
             id,
-            ticker,
-            title,
-            description,
-            article_url,
-            published_utc,
-            TRIM(CONCAT(COALESCE(title, ''), '. ', COALESCE(description, ''))) AS embedding_text
+            location,
+            source_type,
+            headline,
+            narrative_text,
+            effective_at,
+            TRIM(CONCAT(COALESCE(headline, ''), '. ', COALESCE(narrative_text, ''))) AS embedding_text
         FROM {NEWS_TABLE_NAME}
-        WHERE TRIM(CONCAT(COALESCE(title, ''), '. ', COALESCE(description, ''))) IS NOT NULL
-          AND TRIM(CONCAT(COALESCE(title, ''), '. ', COALESCE(description, ''))) != ''
+        WHERE TRIM(CONCAT(COALESCE(headline, ''), '. ', COALESCE(narrative_text, ''))) IS NOT NULL
+          AND TRIM(CONCAT(COALESCE(headline, ''), '. ', COALESCE(narrative_text, ''))) != ''
     """
     
     news_df = pd.read_sql_query(query, conn)
-    print(f"Loaded {len(news_df)} news documents from {NEWS_TABLE_NAME}")
-    display(news_df.head(5))
+    print(f"Loaded {len(news_df)} weather documents from {NEWS_TABLE_NAME}")
+    if len(news_df) > 0:
+        display(news_df.head(5))
+    else:
+        print("(Table is empty — add locations via the app's POST /locationlist endpoint first.)")
 finally:
     conn.close()
 
@@ -479,12 +531,13 @@ for i in range(0, len(news_df), batch_size):
     if (i + batch_size) % 128 == 0:
         print(f"  Processed {min(i + batch_size, len(news_df))}/{len(news_df)} documents")
 
-# Create embeddings DataFrame
+# Compute embeddings DataFrame for weather documents
 embeddings_df = pd.DataFrame({
     "id": news_df["id"],
-    "ticker": news_df["ticker"],
-    "title": news_df["title"],
-    "published_utc": news_df["published_utc"].astype(str),
+    "location": news_df["location"],
+    "source_type": news_df["source_type"],
+    "headline": news_df["headline"],
+    "effective_at": news_df["effective_at"].astype(str),
     "embedding": all_embeddings,
 })
 

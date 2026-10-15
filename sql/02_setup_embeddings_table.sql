@@ -3,7 +3,7 @@
 -- Replace {{EMBEDDING_DIM}} with your model's dimension (e.g., 384 for all-MiniLM-L6-v2)
 
 -- Enable pgvector extension
-CREATE EXTENSION IF NOT EXISTS vector;
+--CREATE EXTENSION IF NOT EXISTS vector;
 
 -- Create the embeddings table
 -- IMPORTANT: Replace {{EMBEDDING_DIM}} below with the correct dimension for your model:
